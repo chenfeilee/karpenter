@@ -73,6 +73,15 @@ var (
 			Objectives: metrics.SummaryObjectives(),
 		},
 	)
+	podScheduledTimeSummary = prometheus.NewSummary(
+		prometheus.SummaryOpts{
+			Namespace:  "karpenter",
+			Subsystem:  "pods",
+			Name:       "scheduled_time_seconds",
+			Help:       "The time from pod creation until the pod is scheduled.",
+			Objectives: metrics.SummaryObjectives(),
+		},
+	)
 )
 
 // Controller for the resource
@@ -86,6 +95,7 @@ type Controller struct {
 func init() {
 	crmetrics.Registry.MustRegister(podGaugeVec)
 	crmetrics.Registry.MustRegister(podStartupTimeSummary)
+	crmetrics.Registry.MustRegister(podScheduledTimeSummary)
 }
 
 func labelNames() []string {
@@ -138,21 +148,27 @@ func (c *Controller) Reconcile(ctx context.Context, req reconcile.Request) (reco
 			Labels:   labels,
 		},
 	})
-	c.recordPodStartupMetric(pod)
+	c.recordPodStartupAndScheduledMetric(pod)
 	return reconcile.Result{}, nil
 }
 
-func (c *Controller) recordPodStartupMetric(pod *v1.Pod) {
+func (c *Controller) recordPodStartupAndScheduledMetric(pod *v1.Pod) {
 	key := client.ObjectKeyFromObject(pod).String()
 	if pod.Status.Phase == phasePending {
 		c.pendingPods.Insert(key)
 		return
 	}
-	cond, ok := lo.Find(pod.Status.Conditions, func(c v1.PodCondition) bool {
+	readyCond, ok := lo.Find(pod.Status.Conditions, func(c v1.PodCondition) bool {
 		return c.Type == v1.PodReady
 	})
 	if c.pendingPods.Has(key) && ok {
-		podStartupTimeSummary.Observe(cond.LastTransitionTime.Sub(pod.CreationTimestamp.Time).Seconds())
+		podStartupTimeSummary.Observe(readyCond.LastTransitionTime.Sub(pod.CreationTimestamp.Time).Seconds())
+		scheduledCond, ok := lo.Find(pod.Status.Conditions, func(c v1.PodCondition) bool {
+			return c.Type == v1.PodScheduled
+		})
+		if ok {
+			podScheduledTimeSummary.Observe(scheduledCond.LastTransitionTime.Sub(pod.CreationTimestamp.Time).Seconds())
+		}
 		c.pendingPods.Delete(key)
 	}
 }
